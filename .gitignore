@@ -1,0 +1,44 @@
+# Derleme çıktıları
+/build/
+/Debug/
+/Release/
+*.exe
+*.app
+*.dSYM/
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.so
+*.dylib
+
+# Geçici / log dosyaları
+*.log
+*.tmp
+*.cache
+*.DS_Store
+
+# Xcode / macOS proje ayarları (kullanıcı‑özel)
+xcuserdata/
+DerivedData/
+*.xcworkspace
+*.xcodeproj/project.xcworkspace/
+*.xcproj/
+*.xcuserstate
+
+# Visual Studio / .NET
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# iOS / SwiftPM
+Package.resolved
+*.swiftpm/
+
+# Büyük binary / disk imajları (LFS tercih edilebilir)
+*.iso
+*.img
+*.raw
