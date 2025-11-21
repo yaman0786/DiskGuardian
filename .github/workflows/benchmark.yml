@@ -1,0 +1,29 @@
+name: Benchmark
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-and-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build
+      - name: Configure
+        run: mkdir -p build && cd build && cmake -G Ninja -DCMAKE_BUILD_TYPE=Release ..
+      - name: Build
+        run: cd build && ninja -v
+      - name: Run benchmark
+        run: |
+          cd build
+          ./src/dg_benchmark > benchmark_output.txt || true
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-output
+          path: build/benchmark_output.txt
