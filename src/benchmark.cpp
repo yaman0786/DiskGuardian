@@ -9,6 +9,10 @@
 #include <thread>
 #include <vector>
 #include <filesystem>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 using highres_clock = std::chrono::high_resolution_clock;
 
@@ -20,13 +24,26 @@ struct AdlerPart { uint32_t A; uint32_t B; size_t len; };
 AdlerPart adler32_chunk(const uint8_t* data, size_t len) {
     uint32_t A = 1;
     uint32_t B = 0;
-    for (size_t i = 0; i < len; ++i) {
-        A += data[i];
-        if (A >= ADLER_MOD) A -= ADLER_MOD;
-        B += A;
-        if (B >= ADLER_MOD) B -= ADLER_MOD;
+    // Fast path: process 16 bytes per iteration (loop unrolling)
+    size_t i = 0;
+    size_t bulk = len / 16;
+    for (size_t b = 0; b < bulk; ++b) {
+        for (int k = 0; k < 16; ++k) {
+            uint8_t v = data[i++];
+            A += v; if (A >= ADLER_MOD) A -= ADLER_MOD;
+            B += A; if (B >= ADLER_MOD) B -= ADLER_MOD;
+        }
+    }
+    for (; i < len; ++i) {
+        A += data[i]; if (A >= ADLER_MOD) A -= ADLER_MOD;
+        B += A; if (B >= ADLER_MOD) B -= ADLER_MOD;
     }
     return {A, B, len};
+}
+
+// mmap-based chunk processing for a mapped buffer
+AdlerPart adler32_chunk_mmap(const uint8_t* data, size_t len) {
+    return adler32_chunk(data, len);
 }
 
 // Combine two AdlerPart values where p1 is the prefix and p2 follows it.
@@ -114,22 +131,39 @@ uint32_t files_work(const std::string& root, unsigned threads) {
         ths.emplace_back([start, end, &files, &parts]() {
             for (size_t i = start; i < end; ++i) {
                 // compute AdlerPart for files[i]
-                FILE* f = fopen(files[i].c_str(), "rb");
-                if (!f) { std::cerr << "Could not open file: " << files[i] << "\n"; parts[i] = {1,0,0}; continue; }
-                uint32_t A = 1, B = 0;
-                constexpr size_t CHUNK = 1 << 20;
-                std::vector<uint8_t> buf(CHUNK);
-                size_t r;
-                size_t total = 0;
-                while ((r = fread(buf.data(), 1, CHUNK, f)) > 0) {
-                    for (size_t k = 0; k < r; ++k) {
-                        A += buf[k]; if (A >= ADLER_MOD) A -= ADLER_MOD;
-                        B += A; if (B >= ADLER_MOD) B -= ADLER_MOD;
+                // Try mmap for large files for zero-copy
+                int fd = open(files[i].c_str(), O_RDONLY);
+                if (fd == -1) { std::cerr << "Could not open file: " << files[i] << "\n"; parts[i] = {1,0,0}; continue; }
+                struct stat st;
+                if (fstat(fd, &st) == -1) { close(fd); parts[i] = {1,0,0}; continue; }
+                size_t total = (size_t)st.st_size;
+                if (total == 0) { close(fd); parts[i] = {1,0,0}; continue; }
+                void* mapped = mmap(nullptr, total, PROT_READ, MAP_PRIVATE, fd, 0);
+                if (mapped == MAP_FAILED) {
+                    // fallback to stdio read
+                    close(fd);
+                    FILE* f = fopen(files[i].c_str(), "rb");
+                    if (!f) { std::cerr << "Could not open file fallback: " << files[i] << "\n"; parts[i] = {1,0,0}; continue; }
+                    uint32_t A = 1, B = 0;
+                    constexpr size_t CHUNK = 1 << 20;
+                    std::vector<uint8_t> buf(CHUNK);
+                    size_t r;
+                    size_t total2 = 0;
+                    while ((r = fread(buf.data(), 1, CHUNK, f)) > 0) {
+                        for (size_t k = 0; k < r; ++k) {
+                            A += buf[k]; if (A >= ADLER_MOD) A -= ADLER_MOD;
+                            B += A; if (B >= ADLER_MOD) B -= ADLER_MOD;
+                        }
+                        total2 += r;
                     }
-                    total += r;
+                    fclose(f);
+                    parts[i] = {A, B, total2};
+                    continue;
                 }
-                fclose(f);
-                parts[i] = {A, B, total};
+                const uint8_t* bytes = reinterpret_cast<const uint8_t*>(mapped);
+                parts[i] = adler32_chunk_mmap(bytes, total);
+                munmap(mapped, total);
+                close(fd);
             }
         });
     }
