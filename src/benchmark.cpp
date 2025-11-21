@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <getopt.h>
 
 using highres_clock = std::chrono::high_resolution_clock;
 
@@ -21,7 +22,42 @@ static const uint32_t ADLER_MOD = 65521u;
 // Adler-32: per-chunk compute starting with A=1,B=0
 struct AdlerPart { uint32_t A; uint32_t B; size_t len; };
 
+// runtime flag controlled from main --simd
+static std::atomic<bool> g_use_fast_adler{false};
+
+// Fast Adler implementation inspired by zlib: process in blocks (NMAX) to
+// reduce the number of modular reductions. This is not architecture-specific
+// SIMD, but it's a high-impact optimization that compilers can further
+// auto-vectorize when available.
+AdlerPart adler32_chunk_fast(const uint8_t* data, size_t len) {
+    uint32_t A = 1;
+    uint32_t B = 0;
+    const size_t NMAX = 5552; // zlib's recommended block size
+    size_t i = 0;
+    while (i < len) {
+        size_t block = std::min(NMAX, len - i);
+        // accumulate without modulo inside the block
+        uint32_t a = A;
+        uint32_t b = B;
+        for (size_t j = 0; j < block; ++j) {
+            a += data[i++];
+            b += a;
+        }
+        // reduce
+        a %= ADLER_MOD;
+        b %= ADLER_MOD;
+        A = a;
+        B = b;
+    }
+    return {A, B, len};
+}
+
 AdlerPart adler32_chunk(const uint8_t* data, size_t len) {
+    // If the fast path is enabled at runtime, use the block-based variant
+    if (g_use_fast_adler.load(std::memory_order_acquire)) {
+        return adler32_chunk_fast(data, len);
+    }
+
     uint32_t A = 1;
     uint32_t B = 0;
     // Fast path: process 16 bytes per iteration (loop unrolling)
@@ -209,27 +245,70 @@ uint32_t files_baseline(const std::string& root) {
     return (B << 16) | A;
 }
 
+
 int main(int argc, char** argv) {
-    size_t bytes = 50 * 1024 * 1024; // default 50 MB
+    // Defaults
+    size_t bytes = 50 * 1024 * 1024; // 50MB
     unsigned threads = std::thread::hardware_concurrency();
     int runs = 3;
-
     bool mode_files = false;
     std::string files_root;
+    bool enable_simd = false;
 
-    if (argc > 1) {
-        std::string a1 = argv[1];
-        if (a1 == "files") {
-            mode_files = true;
-            if (argc > 2) files_root = argv[2]; else { std::cerr << "Usage: dg_benchmark files <path> [threads] [runs]\n"; return 1; }
-            if (argc > 3) threads = static_cast<unsigned>(std::stoul(argv[3]));
-            if (argc > 4) runs = std::stoi(argv[4]);
-        } else {
-            bytes = static_cast<size_t>(std::stoull(a1));
-            if (argc > 2) threads = static_cast<unsigned>(std::stoul(argv[2]));
-            if (argc > 3) runs = std::stoi(argv[3]);
+    // long options
+    static struct option long_options[] = {
+        {"mode", required_argument, nullptr, 'm'},
+        {"bytes", required_argument, nullptr, 'b'},
+        {"threads", required_argument, nullptr, 't'},
+        {"runs", required_argument, nullptr, 'r'},
+        {"path", required_argument, nullptr, 'p'},
+        {"simd", no_argument, nullptr, 's'},
+        {"help", no_argument, nullptr, 'h'},
+        {nullptr, 0, nullptr, 0}
+    };
+
+    int opt;
+    int opt_index = 0;
+    while ((opt = getopt_long(argc, argv, "m:b:t:r:p:sh", long_options, &opt_index)) != -1) {
+        switch (opt) {
+            case 'm': {
+                std::string mv(optarg);
+                if (mv == "files") mode_files = true;
+                break;
+            }
+            case 'b': bytes = static_cast<size_t>(std::stoull(optarg)); break;
+            case 't': threads = static_cast<unsigned>(std::stoul(optarg)); break;
+            case 'r': runs = std::stoi(optarg); break;
+            case 'p': files_root = optarg; break;
+            case 's': enable_simd = true; break;
+            case 'h':
+            default:
+                std::cout << "Usage:\n"
+                          << "  mem mode (default): dg_benchmark [--bytes N] [--threads N] [--runs N]\n"
+                          << "  files mode: dg_benchmark --mode files --path <dir> [--threads N] [--runs N]\n";
+                return 0;
         }
     }
+
+    // Backward compatible positional args if provided
+    if (optind < argc) {
+        // first positional could be 'files' or bytes
+        std::string first = argv[optind++];
+        if (first == "files") {
+            mode_files = true;
+            if (optind < argc) files_root = argv[optind++];
+            if (optind < argc) threads = static_cast<unsigned>(std::stoul(argv[optind++]));
+            if (optind < argc) runs = std::stoi(argv[optind++]);
+        } else {
+            // bytes
+            bytes = static_cast<size_t>(std::stoull(first));
+            if (optind < argc) threads = static_cast<unsigned>(std::stoul(argv[optind++]));
+            if (optind < argc) runs = std::stoi(argv[optind++]);
+        }
+    }
+
+    // enable fast adler if requested
+    if (enable_simd) g_use_fast_adler.store(true, std::memory_order_release);
 
     if (mode_files) {
         std::cout << "Mode: files\n";
